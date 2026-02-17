@@ -1,0 +1,16 @@
+[master (root-commit) 52239f6] Add Salesforce data transfer script with automatic parent-child relationship discovery
+ Committer: root <root@172.16.62.3>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 2 files changed, 978 insertions(+)
+ create mode 100644 README_Salesforce_Data_Transfer.md
+ create mode 100644 salesforce_data_transfer.py
