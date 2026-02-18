@@ -148,9 +148,18 @@ def topological_sort(graph):
 # =====================================================
 
 def fetch_source_records(object_name, fields):
-    query = f"SELECT Id, {', '.join(fields)} FROM {object_name}"
-    return source_sf.query_all(query)["records"]
 
+    if "RecordTypeId" not in fields:
+        fields.append("RecordTypeId")
+
+    query = f"""
+    SELECT Id,
+           {', '.join(fields)},
+           RecordType.DeveloperName
+    FROM {object_name}
+    """
+
+    return source_sf.query_all(query)["records"]
 
 def fetch_target_name_map(object_name):
     query = f"SELECT Id, Name FROM {object_name}"
@@ -178,8 +187,68 @@ def remove_null_fields(record):
     """Remove fields with None values."""
     return {k: v for k, v in record.items() if v is not None}
 
+# =====================================================
+# RECORD TYPE HANDLING
+# =====================================================
+
+def build_target_recordtype_map():
+    """
+    Builds a mapping:
+    {
+        'Account': {
+            'Business': '012XXXXXXXXXXXX',
+            'PersonAccount': '012YYYYYYYYYYYY'
+        }
+    }
+    """
+
+    recordtype_map = defaultdict(dict)
+
+    try:
+        query = """
+        SELECT Id, DeveloperName, SObjectType
+        FROM RecordType
+        WHERE IsActive = true
+        """
+
+        results = target_sf.query_all(query)["records"]
+
+        for rt in results:
+            sobject = rt["SObjectType"]
+            devname = rt["DeveloperName"]
+            recordtype_map[sobject][devname] = rt["Id"]
+
+        logging.info("Target RecordType map built successfully.")
+
+    except Exception:
+        logging.error("Failed building target RecordType map", exc_info=True)
+
+    return recordtype_map
+
+
+def remap_recordtype(record, object_name, target_rt_map):
+    """
+    Replace source RecordTypeId with correct target RecordTypeId
+    using DeveloperName match.
+    """
+
+    if "RecordType" not in record or not record["RecordType"]:
+        return record
+
+    source_devname = record["RecordType"]["DeveloperName"]
+
+    if object_name in target_rt_map and source_devname in target_rt_map[object_name]:
+        record["RecordTypeId"] = target_rt_map[object_name][source_devname]
+    else:
+        logging.warning(
+            f"RecordType missing in target for {object_name} → {source_devname}"
+        )
+
+    return record
+
 
 def migrate():
+    target_recordtype_map = build_target_recordtype_map()
 
     id_map = {}
 
@@ -218,16 +287,18 @@ def migrate():
             for record in source_records:
 
                 stats["processed"] += 1
-                source_id = record["Id"]
+		record.pop("attributes", None)
+		source_id = record.pop("Id")
 
-                record.pop("attributes", None)
-                record.pop("Id", None)
+		# Remap RecordTypeId
+		record = remap_recordtype(record, obj, target_recordtype_map)
+		record.pop("RecordType", None)
 
-                # Remap lookups
-                record = remap_lookup_ids(record, lookup_fields, id_map)
+		# Remap lookups
+		record = remap_lookup_ids(record, lookup_fields, id_map)
 
-                # 🚀 REMOVE NULL FIELDS HERE
-                record = remove_null_fields(record)
+		# Remove null fields
+		record = remove_null_fields(record)
 
                 # Skip empty records
                 if not record or "Name" not in record:
