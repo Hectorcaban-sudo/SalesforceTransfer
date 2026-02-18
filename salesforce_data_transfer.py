@@ -387,6 +387,187 @@ class SalesforceDataTransfer:
             logger.error(f"Error getting target RecordType ID: {str(e)}")
             return None
     
+    def get_unique_identifier_fields(self, sf: Salesforce, object_name: str) -> List[str]:
+        """
+        Identify unique identifier fields for an object
+        
+        Args:
+            sf: Salesforce connection object
+            object_name: Name of the Salesforce object
+        
+        Returns:
+            List of unique identifier field names
+        """
+        try:
+            describe = getattr(sf, object_name).describe()
+            unique_fields = []
+            
+            # Priority order for unique identifiers
+            for field in describe['fields']:
+                if field['type'] == 'id' or field['name'] == 'Id':
+                    continue
+                
+                # Check for unique constraints
+                if field['unique']:
+                    unique_fields.append(field['name'])
+                
+                # Add Name field if it exists
+                if field['name'] == 'Name':
+                    if 'Name' not in unique_fields:
+                        unique_fields.append('Name')
+                
+                # Add common identifier fields
+                if field['name'] in ['Email', 'ExternalId', 'External_ID__c']:
+                    if field['name'] not in unique_fields:
+                        unique_fields.append(field['name'])
+            
+            return unique_fields
+            
+        except Exception as e:
+            logger.error(f"Error getting unique identifier fields: {str(e)}")
+            return ['Name']  # Default to Name field
+    
+    def build_existing_id_mappings(self, object_name: str, source_records: List[Dict]):
+        """
+        Build ID mappings for existing records in target system
+        
+        Queries target system for records that already exist and creates mappings
+        based on unique identifiers like Name, Email, etc.
+        
+        Args:
+            object_name: Name of the Salesforce object
+            source_records: Source records to build mappings for
+        """
+        logger.info(f"Building ID mappings for existing {object_name} records in target...")
+        
+        try:
+            # Get unique identifier fields for this object
+            unique_fields = self.get_unique_identifier_fields(self.source, object_name)
+            
+            if not unique_fields:
+                logger.warning(f"No unique identifier fields found for {object_name}")
+                return
+            
+            # Use the first available unique field (usually Name or Email)
+            identifier_field = unique_fields[0]
+            logger.info(f"Using '{identifier_field}' as identifier for {object_name}")
+            
+            # Extract unique values from source records
+            source_values = {}
+            for record in source_records:
+                value = record.get(identifier_field)
+                if value:
+                    source_values[value] = record.get('Id')
+            
+            if not source_values:
+                logger.info(f"No {identifier_field} values found in source records for {object_name}")
+                return
+            
+            logger.info(f"Found {len(source_values)} unique {identifier_field} values in source")
+            
+            # Query target system for matching records
+            # Handle up to 500 values per query (Salesforce SOQL limit)
+            all_values = list(source_values.keys())
+            chunk_size = 500
+            
+            mappings_found = 0
+            for i in range(0, len(all_values), chunk_size):
+                chunk = all_values[i:i + chunk_size]
+                
+                # Build IN clause for SOQL
+                values_str = "', '".join([str(v).replace("'", "\\'") for v in chunk])
+                soql = f"SELECT Id, {identifier_field} FROM {object_name} WHERE {identifier_field} IN ('{values_str}')"
+                
+                try:
+                    result = self.target.query(soql)
+                    
+                    for target_record in result['records']:
+                        target_value = target_record.get(identifier_field)
+                        target_id = target_record.get('Id')
+                        
+                        if target_value and target_value in source_values:
+                            source_id = source_values[target_value]
+                            
+                            # Store mapping
+                            if object_name not in self.id_mappings:
+                                self.id_mappings[object_name] = {}
+                            
+                            self.id_mappings[object_name][source_id] = target_id
+                            mappings_found += 1
+                            logger.debug(f"Mapped existing {object_name}: {target_value} -> {target_id}")
+                
+                except Exception as e:
+                    logger.error(f"Error querying target for {object_name} chunk {i}: {str(e)}")
+            
+            logger.info(f"Built {mappings_found} ID mappings for existing {object_name} records")
+            
+        except Exception as e:
+            logger.error(f"Error building existing ID mappings: {str(e)}")
+    
+    def _find_target_record_by_source_id(self, object_name: str, source_id: str) -> str:
+        """
+        Find a target record ID by querying the target system with source record data
+        
+        This is used when a lookup field references a record that wasn't in the initial batch
+        or when we need to resolve lookups for records that already exist in target.
+        
+        Args:
+            object_name: Name of the Salesforce object
+            source_id: Source record ID
+        
+        Returns:
+            Target record ID or None if not found
+        """
+        try:
+            # Query source system to get the record's unique identifiers
+            unique_fields = self.get_unique_identifier_fields(self.source, object_name)
+            
+            if not unique_fields:
+                logger.debug(f"No unique fields to query for {object_name}")
+                return None
+            
+            # Query source record
+            fields_to_query = ', '.join(unique_fields)
+            soql = f"SELECT {fields_to_query} FROM {object_name} WHERE Id = '{source_id}' LIMIT 1"
+            
+            try:
+                result = self.source.query(soql)
+                
+                if not result['records']:
+                    logger.debug(f"Source record {source_id} not found in {object_name}")
+                    return None
+                
+                source_record = result['records'][0]
+                
+                # Now query target system using these identifiers
+                for field_name in unique_fields:
+                    field_value = source_record.get(field_name)
+                    if field_value:
+                        # Query target for matching record
+                        safe_value = str(field_value).replace("'", "\\'")
+                        target_soql = f"SELECT Id FROM {object_name} WHERE {field_name} = '{safe_value}' LIMIT 1"
+                        
+                        try:
+                            target_result = self.target.query(target_soql)
+                            if target_result['records']:
+                                target_id = target_result['records'][0]['Id']
+                                logger.debug(f"Found target record for {object_name} using {field_name}: {field_value}")
+                                return target_id
+                        except Exception as e:
+                            logger.debug(f"Error querying target for {field_name}={field_value}: {str(e)}")
+                            continue
+                
+                logger.debug(f"Could not find matching target record for source {source_id}")
+                return None
+                
+            except Exception as e:
+                logger.error(f"Error querying source record {source_id}: {str(e)}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error finding target record by source ID: {str(e)}")
+            return None
+    
     def prepare_record_for_insert(self, record: Dict, object_name: str, 
                                  lookup_fields: Dict) -> Dict:
         """
@@ -449,9 +630,19 @@ class SalesforceDataTransfer:
                     prepared_record[field] = self.id_mappings[referenced_object][value]
                     logger.debug(f"Mapped {field}: {value} -> {prepared_record[field]}")
                 else:
-                    # No mapping found - skip the lookup field
-                    logger.warning(f"No ID mapping found for {field} -> {value} (referencing {referenced_object})")
-                    continue
+                    # No mapping found - try to find the record in target system
+                    target_id = self._find_target_record_by_source_id(referenced_object, value)
+                    if target_id:
+                        prepared_record[field] = target_id
+                        # Store the mapping for future use
+                        if referenced_object not in self.id_mappings:
+                            self.id_mappings[referenced_object] = {}
+                        self.id_mappings[referenced_object][value] = target_id
+                        logger.debug(f"Resolved {field}: {value} -> {target_id} from target system")
+                    else:
+                        # No mapping found - skip the lookup field
+                        logger.warning(f"No ID mapping found for {field} -> {value} (referencing {referenced_object})")
+                        continue
             else:
                 # Regular field
                 prepared_record[field] = value
@@ -490,6 +681,9 @@ class SalesforceDataTransfer:
             
             # Build RecordType mappings for this object
             self.build_record_type_mapping(object_name)
+            
+            # Build ID mappings for existing records in target system
+            self.build_existing_id_mappings(object_name, source_records)
             
             # Retrieve source records
             source_records = self.get_all_records(
