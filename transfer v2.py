@@ -30,8 +30,6 @@ OBJECTS_TO_MIGRATE = [
 ]
 
 BATCH_SIZE = 5000
-
-# Optional: Set to False if you do NOT want OwnerId migrated
 MIGRATE_OWNER = False
 
 
@@ -61,79 +59,56 @@ try:
     print("Connected to both sandboxes.")
 except Exception as e:
     logging.critical("Connection failed", exc_info=True)
-    print("Connection failed:", e)
-    sys.exit(1)
+    sys.exit("Salesforce connection failed.")
 
 
 # =====================================================
-# METADATA SAFE FIELD FILTER
+# FIELD FILTERING
 # =====================================================
 
 def get_safe_fields(sf, object_name):
-    """
-    Returns ONLY fields that are safe to insert/update.
-    Uses describe metadata flags.
-    """
 
-    try:
-        desc = sf.__getattr__(object_name).describe()
-        safe_fields = []
+    desc = sf.__getattr__(object_name).describe()
+    safe_fields = []
 
-        for field in desc["fields"]:
+    for field in desc["fields"]:
 
-            # Skip system / calculated / read-only fields
-            if not field["createable"]:
-                continue
+        if not field["createable"]:
+            continue
+        if field["calculated"]:
+            continue
+        if field["autoNumber"]:
+            continue
+        if field["name"] in [
+            "Id",
+            "CreatedDate",
+            "CreatedById",
+            "LastModifiedDate",
+            "LastModifiedById",
+            "SystemModstamp",
+            "IsDeleted",
+            "IsPartner",
+        ]:
+            continue
+        if not MIGRATE_OWNER and field["name"] == "OwnerId":
+            continue
 
-            if field["calculated"]:
-                continue
+        safe_fields.append(field["name"])
 
-            if field["autoNumber"]:
-                continue
-
-            if field["type"] in ["location", "address"]:
-                continue
-
-            # Explicit system exclusions
-            if field["name"] in [
-                "Id",
-                "CreatedDate",
-                "CreatedById",
-                "LastModifiedDate",
-                "LastModifiedById",
-                "SystemModstamp",
-                "IsDeleted",
-                "IsPartner",
-            ]:
-                continue
-
-            if not MIGRATE_OWNER and field["name"] == "OwnerId":
-                continue
-
-            safe_fields.append(field["name"])
-
-        return safe_fields
-
-    except Exception:
-        logging.error(f"Describe failed for {object_name}", exc_info=True)
-        return []
+    return safe_fields
 
 
 def get_lookup_fields(sf, object_name):
-    try:
-        desc = sf.__getattr__(object_name).describe()
-        return {
-            field["name"]: field["referenceTo"]
-            for field in desc["fields"]
-            if field["type"] == "reference"
-        }
-    except Exception:
-        logging.error(f"Lookup detection failed for {object_name}", exc_info=True)
-        return {}
+    desc = sf.__getattr__(object_name).describe()
+    return {
+        field["name"]: field["referenceTo"]
+        for field in desc["fields"]
+        if field["type"] == "reference"
+    }
 
 
 # =====================================================
-# DEPENDENCY GRAPH
+# DEPENDENCY ORDER
 # =====================================================
 
 def build_dependency_graph(sf, objects):
@@ -179,16 +154,15 @@ def topological_sort(graph):
 # HELPERS
 # =====================================================
 
-def fetch_records(sf, object_name, fields):
-    try:
-        query = f"SELECT Id, {', '.join(fields)} FROM {object_name}"
-        return sf.query_all(query)["records"]
-    except SalesforceMalformedRequest as e:
-        logging.error(f"Query failed for {object_name}: {e.content}")
-        return []
-    except Exception:
-        logging.error(f"Unexpected query error for {object_name}", exc_info=True)
-        return []
+def fetch_source_records(object_name, fields):
+    query = f"SELECT Id, {', '.join(fields)} FROM {object_name}"
+    return source_sf.query_all(query)["records"]
+
+
+def fetch_target_name_map(object_name):
+    query = f"SELECT Id, Name FROM {object_name}"
+    records = target_sf.query_all(query)["records"]
+    return {r["Name"]: r["Id"] for r in records}
 
 
 def chunk_list(data, size):
@@ -211,7 +185,6 @@ def migrate():
 
     id_map = {}
 
-    print("Building dependency graph...")
     graph = build_dependency_graph(source_sf, OBJECTS_TO_MIGRATE)
     migration_order = topological_sort(graph)
 
@@ -229,45 +202,70 @@ def migrate():
                 continue
 
             lookup_fields = get_lookup_fields(source_sf, obj)
-            records = fetch_records(source_sf, obj, fields)
 
-            if not records:
-                print(f"No records found for {obj}")
-                continue
+            source_records = fetch_source_records(obj, fields)
+            target_name_map = fetch_target_name_map(obj)
 
-            prepared_records = []
+            insert_list = []
+            update_list = []
 
-            for record in records:
+            for record in source_records:
+
                 source_id = record["Id"]
                 record.pop("attributes", None)
                 record.pop("Id", None)
 
                 record = remap_lookup_ids(record, lookup_fields, id_map)
 
-                prepared_records.append((source_id, record))
+                if record["Name"] in target_name_map:
+                    record["Id"] = target_name_map[record["Name"]]
+                    update_list.append((source_id, record))
+                else:
+                    insert_list.append((source_id, record))
 
-            for batch in chunk_list(prepared_records, BATCH_SIZE):
+            # =============================
+            # BULK INSERT
+            # =============================
 
-                batch_payload = [r[1] for r in batch]
+            for batch in chunk_list(insert_list, BATCH_SIZE):
 
-                results = target_sf.bulk.__getattr__(obj).upsert(
-                    batch_payload,
-                    external_id_field="Name"
-                )
+                payload = [r[1] for r in batch]
+
+                results = target_sf.bulk.__getattr__(obj).insert(payload)
 
                 for i, result in enumerate(results):
-
                     source_id = batch[i][0]
 
                     if result["success"]:
                         id_map[source_id] = result["id"]
                     else:
-                        failure_detail = {
+                        failure_logger.error(json.dumps({
                             "object": obj,
-                            "source_id": source_id,
+                            "operation": "insert",
                             "errors": result["errors"]
-                        }
-                        failure_logger.error(json.dumps(failure_detail))
+                        }))
+
+            # =============================
+            # BULK UPDATE
+            # =============================
+
+            for batch in chunk_list(update_list, BATCH_SIZE):
+
+                payload = [r[1] for r in batch]
+
+                results = target_sf.bulk.__getattr__(obj).update(payload)
+
+                for i, result in enumerate(results):
+                    source_id = batch[i][0]
+
+                    if result["success"]:
+                        id_map[source_id] = result["id"]
+                    else:
+                        failure_logger.error(json.dumps({
+                            "object": obj,
+                            "operation": "update",
+                            "errors": result["errors"]
+                        }))
 
             print(f"Finished {obj}")
 
