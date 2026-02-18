@@ -4,7 +4,6 @@ from simple_salesforce.exceptions import SalesforceMalformedRequest
 from collections import defaultdict, deque
 import sys
 import json
-from datetime import datetime
 
 # =====================================================
 # CONFIGURATION
@@ -24,7 +23,6 @@ TARGET_CONFIG = {
     "domain": "test"
 }
 
-# 👇 Define objects here
 OBJECTS_TO_MIGRATE = [
     "Account",
     "Contact",
@@ -33,9 +31,12 @@ OBJECTS_TO_MIGRATE = [
 
 BATCH_SIZE = 5000
 
+# Optional: Set to False if you do NOT want OwnerId migrated
+MIGRATE_OWNER = False
+
 
 # =====================================================
-# LOGGING SETUP
+# LOGGING
 # =====================================================
 
 logging.basicConfig(
@@ -49,14 +50,9 @@ failure_handler = logging.FileHandler("migration_failures.log")
 failure_logger.addHandler(failure_handler)
 failure_logger.setLevel(logging.ERROR)
 
-summary_logger = logging.getLogger("summary")
-summary_handler = logging.FileHandler("migration_summary.log")
-summary_logger.addHandler(summary_handler)
-summary_logger.setLevel(logging.INFO)
-
 
 # =====================================================
-# CONNECTION
+# CONNECT
 # =====================================================
 
 try:
@@ -70,17 +66,54 @@ except Exception as e:
 
 
 # =====================================================
-# METADATA HELPERS
+# METADATA SAFE FIELD FILTER
 # =====================================================
 
-def get_creatable_fields(sf, object_name):
+def get_safe_fields(sf, object_name):
+    """
+    Returns ONLY fields that are safe to insert/update.
+    Uses describe metadata flags.
+    """
+
     try:
         desc = sf.__getattr__(object_name).describe()
-        return [
-            field["name"]
-            for field in desc["fields"]
-            if field["createable"] and not field["autoNumber"]
-        ]
+        safe_fields = []
+
+        for field in desc["fields"]:
+
+            # Skip system / calculated / read-only fields
+            if not field["createable"]:
+                continue
+
+            if field["calculated"]:
+                continue
+
+            if field["autoNumber"]:
+                continue
+
+            if field["type"] in ["location", "address"]:
+                continue
+
+            # Explicit system exclusions
+            if field["name"] in [
+                "Id",
+                "CreatedDate",
+                "CreatedById",
+                "LastModifiedDate",
+                "LastModifiedById",
+                "SystemModstamp",
+                "IsDeleted",
+                "IsPartner",
+            ]:
+                continue
+
+            if not MIGRATE_OWNER and field["name"] == "OwnerId":
+                continue
+
+            safe_fields.append(field["name"])
+
+        return safe_fields
+
     except Exception:
         logging.error(f"Describe failed for {object_name}", exc_info=True)
         return []
@@ -176,8 +209,6 @@ def remap_lookup_ids(record, lookup_fields, id_map):
 
 def migrate():
 
-    global_summary = {}
-
     id_map = {}
 
     print("Building dependency graph...")
@@ -185,21 +216,13 @@ def migrate():
     migration_order = topological_sort(graph)
 
     print("Migration order:", migration_order)
-    logging.info(f"Migration order: {migration_order}")
 
     for obj in migration_order:
 
         print(f"\nMigrating {obj}...")
-        logging.info(f"Starting {obj}")
-
-        object_summary = {
-            "processed": 0,
-            "success": 0,
-            "failed": 0
-        }
 
         try:
-            fields = get_creatable_fields(source_sf, obj)
+            fields = get_safe_fields(source_sf, obj)
 
             if "Name" not in fields:
                 print(f"Skipping {obj} (no Name field)")
@@ -218,69 +241,40 @@ def migrate():
                 source_id = record["Id"]
                 record.pop("attributes", None)
                 record.pop("Id", None)
+
                 record = remap_lookup_ids(record, lookup_fields, id_map)
+
                 prepared_records.append((source_id, record))
 
             for batch in chunk_list(prepared_records, BATCH_SIZE):
 
                 batch_payload = [r[1] for r in batch]
-                object_summary["processed"] += len(batch_payload)
 
-                try:
-                    results = target_sf.bulk.__getattr__(obj).upsert(
-                        batch_payload,
-                        external_id_field="Name"
-                    )
+                results = target_sf.bulk.__getattr__(obj).upsert(
+                    batch_payload,
+                    external_id_field="Name"
+                )
 
-                    for i, result in enumerate(results):
+                for i, result in enumerate(results):
 
-                        source_id = batch[i][0]
+                    source_id = batch[i][0]
 
-                        if result["success"]:
-                            object_summary["success"] += 1
-                            id_map[source_id] = result["id"]
-                        else:
-                            object_summary["failed"] += 1
+                    if result["success"]:
+                        id_map[source_id] = result["id"]
+                    else:
+                        failure_detail = {
+                            "object": obj,
+                            "source_id": source_id,
+                            "errors": result["errors"]
+                        }
+                        failure_logger.error(json.dumps(failure_detail))
 
-                            failure_detail = {
-                                "object": obj,
-                                "source_id": source_id,
-                                "errors": result["errors"],
-                                "record": batch[i][1]
-                            }
-
-                            failure_logger.error(json.dumps(failure_detail))
-
-                except Exception:
-                    logging.error(f"Bulk failure for {obj}", exc_info=True)
-
-            print(f"{obj} Completed → "
-                  f"Processed: {object_summary['processed']} | "
-                  f"Success: {object_summary['success']} | "
-                  f"Failed: {object_summary['failed']}")
-
-            global_summary[obj] = object_summary
+            print(f"Finished {obj}")
 
         except Exception:
             logging.error(f"Unexpected failure for {obj}", exc_info=True)
 
-    # =====================================================
-    # FINAL SUMMARY
-    # =====================================================
-
-    print("\n====== MIGRATION SUMMARY ======")
-
-    for obj, stats in global_summary.items():
-        summary_line = (
-            f"{obj} → Processed: {stats['processed']} | "
-            f"Success: {stats['success']} | "
-            f"Failed: {stats['failed']}"
-        )
-        print(summary_line)
-        summary_logger.info(summary_line)
-
-    print("Migration complete.")
-    logging.info("Migration finished.")
+    print("\nMigration Complete.")
 
 
 # =====================================================
