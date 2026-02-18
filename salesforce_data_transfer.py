@@ -242,67 +242,67 @@ class SalesforceDataTransfer:
         logger.info(f"Optimal transfer order determined: {' -> '.join(result)}")
         return result
     
-    def find_external_id_fields(self, object_name: str) -> str:
+    def _update_id_mappings_after_batch(self, object_name: str, batch_records: List[Dict]):
         """
-        Find the best external ID field for an object
+        Update ID mappings after successful batch creation by querying created records
         
         Args:
             object_name: Name of the Salesforce object
-        
-        Returns:
-            Name of external ID field or None if not found
+            batch_records: Records that were just created with source IDs
         """
         try:
-            describe = getattr(self.source, object_name).describe()
+            # Get target IDs from the batch results
+            source_ids = [rec['source_id'] for rec in batch_records if rec.get('source_id')]
+            target_ids = [rec['target_id'] for rec in batch_records if rec.get('target_id')]
             
-            # Priority order for external ID fields
-            priority_fields = ['External_ID__c', 'ExternalId', 'ExternalID', 'Id']
-            
-            # Check for common external ID patterns
-            for field in describe['fields']:
-                field_name = field['name']
-                
-                # Check if it's explicitly marked as external ID
-                if field.get('externalId'):
-                    return field_name
-                
-                # Check for common naming patterns
-                for priority in priority_fields:
-                    if field_name.lower() == priority.lower():
-                        return field_name
-            
-            # If no external ID found, return None
-            logger.debug(f"No external ID field found for {object_name}")
-            return None
+            # Create mappings
+            for rec in batch_records:
+                if rec.get('source_id') and rec.get('target_id'):
+                    self.id_mappings[object_name][rec['source_id']] = rec['target_id']
             
         except Exception as e:
-            logger.error(f"Error finding external ID field: {str(e)}")
-            return None
+            logger.error(f"Error updating ID mappings after batch: {str(e)}")
     
     def prepare_record_for_insert(self, record: Dict, object_name: str, 
-                                 lookup_fields: Dict, 
-                                 external_id_field: str = None) -> Dict:
+                                 lookup_fields: Dict) -> Dict:
         """
-        Prepare a record for insertion by handling lookup fields and IDs
+        Prepare a record for insertion by handling lookup fields and filtering system fields
         
         Args:
             record: Source record dictionary
             object_name: Name of the Salesforce object
             lookup_fields: Dictionary of lookup fields and their referenced objects
-            external_id_field: External ID field to use for upsert (optional)
         
         Returns:
             Prepared record dictionary with updated lookup references
         """
         prepared_record = {}
         
+        # Comprehensive list of system fields to exclude
+        system_fields = [
+            'Id', 'CreatedDate', 'CreatedById', 
+            'LastModifiedDate', 'LastModifiedById',
+            'IsDeleted', 'SystemModstamp', 'LastViewedDate',
+            'LastReferencedDate', 'JigsawContactId', 'JigsawCompanyId',
+            'IsPartner', 'IsAccountDeleted', 'IsPersonAccount',
+            'MasterRecordId', 'RecordTypeId', 'OwnerChangeOption',
+            'PhotoUrl', 'IndividualId', 'BillingGeocodeAccuracy',
+            'ShippingGeocodeAccuracy', 'EmailBouncedReason',
+            'EmailBouncedDate', 'LastActivityDate', 'LastCURequestDate',
+            'LastCUUpdateDate', 'LastReferencedDate', 'LastViewedDate',
+            'CleanStatus', 'CurrencyIsoCode'
+        ]
+        
         for field, value in record.items():
             if value is None:
                 continue
                 
-            # Skip system fields and ID fields for new records
-            if field in ['Id', 'CreatedDate', 'CreatedById', 
-                        'LastModifiedDate', 'LastModifiedById']:
+            # Skip system fields
+            if field in system_fields:
+                continue
+            
+            # Skip fields ending with common system patterns
+            if any(field.endswith(suffix) for suffix in ['__s', '__pc', '__History', '__Feed', '__Share', '__Tag', '__Layout', '__Track']):
                 continue
             
             # Handle lookup fields
@@ -315,11 +315,9 @@ class SalesforceDataTransfer:
                     prepared_record[field] = self.id_mappings[referenced_object][value]
                     logger.debug(f"Mapped {field}: {value} -> {prepared_record[field]}")
                 else:
-                    # No mapping found - you might want to log this or skip the record
+                    # No mapping found - skip the lookup field
                     logger.warning(f"No ID mapping found for {field} -> {value} (referencing {referenced_object})")
-                    # Option 1: Skip the lookup field
-                    # Option 2: Skip the entire record (uncomment below)
-                    # return None
+                    continue
             else:
                 # Regular field
                 prepared_record[field] = value
@@ -327,23 +325,19 @@ class SalesforceDataTransfer:
         return prepared_record
     
     def transfer_records(self, object_name: str, batch_size: int = 50,
-                        external_id_field: str = None, 
-                        query_fields: List[str] = None,
-                        skip_existing: bool = True) -> Dict:
+                        query_fields: List[str] = None) -> Dict:
         """
-        Transfer records from source to target sandbox
+        Transfer records from source to target sandbox using batch API
         
         Args:
             object_name: Name of the Salesforce object to transfer
             batch_size: Number of records to process in each batch
-            external_id_field: External ID field for upsert operations (optional)
             query_fields: Specific fields to query (optional)
-            skip_existing: Skip records that already exist in target (for upsert)
         
         Returns:
             Dictionary with transfer statistics
         """
-        logger.info(f"Starting data transfer for {object_name}...")
+        logger.info(f"Starting data transfer for {object_name} using batch API...")
         
         # Initialize ID mappings for this object
         self.id_mappings[object_name] = {}
@@ -352,7 +346,7 @@ class SalesforceDataTransfer:
             'total': 0,
             'success': 0,
             'failed': 0,
-            'skipped': 0,
+            'batches_processed': 0,
             'errors': []
         }
         
@@ -367,66 +361,60 @@ class SalesforceDataTransfer:
             
             stats['total'] = len(source_records)
             
+            if not source_records:
+                logger.info(f"No records found in {object_name}")
+                return stats
+            
             # Process records in batches
             for i in range(0, len(source_records), batch_size):
                 batch = source_records[i:i + batch_size]
-                logger.info(f"Processing batch {i // batch_size + 1}/{(len(source_records) + batch_size - 1) // batch_size}")
+                batch_num = i // batch_size + 1
+                total_batches = (len(source_records) + batch_size - 1) // batch_size
                 
+                logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} records)")
+                
+                # Prepare all records in the batch
+                prepared_records = []
                 for record in batch:
                     try:
-                        # Prepare record with lookup field mappings
                         prepared_record = self.prepare_record_for_insert(
-                            record, object_name, lookup_fields, external_id_field
+                            record, object_name, lookup_fields
                         )
-                        
-                        if prepared_record is None:
-                            stats['skipped'] += 1
-                            continue
-                        
-                        # Insert or Upsert record
-                        if external_id_field:
-                            # Use upsert with external ID
-                            external_id_value = prepared_record.get(external_id_field)
-                            if external_id_value:
-                                getattr(self.target, object_name).upsert(
-                                    prepared_record,
-                                    external_id_field
-                                )
-                                logger.debug(f"Upserted record with external ID: {external_id_value}")
-                            else:
-                                logger.warning(f"External ID field '{external_id_field}' not found in record, skipping upsert")
-                                stats['skipped'] += 1
-                                continue
-                        else:
-                            # Regular insert
-                            getattr(self.target, object_name).create(prepared_record)
-                        
-                        stats['success'] += 1
-                        
-                        # Store ID mapping for future lookup field resolution
-                        if 'Id' in record:
-                            # Query the created record to get its new ID
-                            # This is a simplified approach - in production, you might want to use a more efficient method
-                            # For now, we'll store the mapping after successful insert
-                            pass  # We'll need to get the created record's ID
-                        
+                        prepared_records.append({
+                            'prepared': prepared_record,
+                            'source_id': record.get('Id'),
+                            'name': record.get('Name')
+                        })
                     except Exception as e:
-                        error_msg = f"Error transferring record: {str(e)}"
-                        logger.error(error_msg)
+                        logger.error(f"Error preparing record: {str(e)}")
                         stats['failed'] += 1
                         stats['errors'].append({
                             'record': record,
-                            'error': str(e)
+                            'error': f"Preparation failed: {str(e)}"
                         })
-            
-            # Get ID mappings after successful inserts
-            # This is important for related objects that reference this one
-            if stats['success'] > 0:
-                self._update_id_mappings(object_name, source_records, external_id_field)
+                
+                # Process batch using composite API for efficiency
+                if prepared_records:
+                    batch_results = self._process_batch(object_name, prepared_records)
+                    
+                    # Update statistics
+                    stats['success'] += batch_results['success']
+                    stats['failed'] += batch_results['failed']
+                    stats['errors'].extend(batch_results['errors'])
+                    
+                    # Store ID mappings for this batch
+                    for result in batch_results['id_mappings']:
+                        source_id = result['source_id']
+                        target_id = result['target_id']
+                        if source_id and target_id:
+                            self.id_mappings[object_name][source_id] = target_id
+                
+                stats['batches_processed'] += 1
+                logger.info(f"Batch {batch_num} completed: {batch_results['success']} success, {batch_results['failed']} failed")
             
             logger.info(f"Transfer complete for {object_name}")
             logger.info(f"Total: {stats['total']}, Success: {stats['success']}, "
-                       f"Failed: {stats['failed']}, Skipped: {stats['skipped']}")
+                       f"Failed: {stats['failed']}, Batches: {stats['batches_processed']}")
             
             return stats
             
@@ -434,81 +422,161 @@ class SalesforceDataTransfer:
             logger.error(f"Fatal error during transfer: {str(e)}")
             raise
     
-    def _update_id_mappings(self, object_name: str, source_records: List[Dict],
-                           external_id_field: str = None):
+    def _process_batch(self, object_name: str, prepared_records: List[Dict]) -> Dict:
         """
-        Update ID mappings after successful record creation
+        Process a batch of records using Salesforce Composite API
+        
+        Args:
+            object_name: Name of the Salesforce object
+            prepared_records: List of prepared records with metadata
+        
+        Returns:
+            Dictionary with batch processing results
+        """
+        results = {
+            'success': 0,
+            'failed': 0,
+            'errors': [],
+            'id_mappings': []
+        }
+        
+        # For better performance, we'll process records in smaller chunks
+        # Salesforce Composite API has limits on request size
+        chunk_size = 25  # Process 25 records at a time
+        
+        for i in range(0, len(prepared_records), chunk_size):
+            chunk = prepared_records[i:i + chunk_size]
+            
+            # Build composite request body
+            composite_requests = []
+            for idx, record_data in enumerate(chunk):
+                request_body = {
+                    'method': 'POST',
+                    'url': f'/services/data/v56.0/sobjects/{object_name}/',
+                    'referenceId': f'record_{i + idx}',
+                    'body': record_data['prepared']
+                }
+                composite_requests.append(request_body)
+            
+            try:
+                # Execute composite request
+                composite_result = self.target.restful(
+                    'composite',
+                    method='POST',
+                    data={
+                        'allOrNone': False,
+                        'compositeRequest': composite_requests
+                    }
+                )
+                
+                # Process results
+                for idx, response in enumerate(composite_result.get('compositeResponse', [])):
+                    original_record = chunk[idx]
+                    
+                    if response['httpStatusCode'] in [200, 201]:
+                        # Success - store ID mapping
+                        results['success'] += 1
+                        results['id_mappings'].append({
+                            'source_id': original_record['source_id'],
+                            'target_id': response['body'].get('id'),
+                            'name': original_record['name']
+                        })
+                    else:
+                        # Failure - log error
+                        results['failed'] += 1
+                        error_info = response.get('body', {})
+                        results['errors'].append({
+                            'record': original_record['prepared'],
+                            'error': error_info,
+                            'source_id': original_record['source_id'],
+                            'name': original_record['name']
+                        })
+                        logger.error(f"Record {original_record.get('name', 'Unknown')} failed: {error_info}")
+                
+            except Exception as e:
+                # If composite API fails, fall back to individual creates
+                logger.warning(f"Composite API failed, falling back to individual creates: {str(e)}")
+                
+                for record_data in chunk:
+                    try:
+                        result = getattr(self.target, object_name).create(record_data['prepared'])
+                        results['success'] += 1
+                        results['id_mappings'].append({
+                            'source_id': record_data['source_id'],
+                            'target_id': result.get('id'),
+                            'name': record_data['name']
+                        })
+                    except Exception as individual_error:
+                        results['failed'] += 1
+                        results['errors'].append({
+                            'record': record_data['prepared'],
+                            'error': str(individual_error),
+                            'source_id': record_data['source_id'],
+                            'name': record_data['name']
+                        })
+        
+        return results
+    
+    def _update_id_mappings(self, object_name: str, source_records: List[Dict]):
+        """
+        Update ID mappings after successful record creation using Name field
         
         Args:
             object_name: Name of the Salesforce object
             source_records: Original source records
-            external_id_field: External ID field used for matching
         """
-        logger.info(f"Updating ID mappings for {object_name}...")
+        logger.info(f"Updating ID mappings for {object_name} using Name field...")
         
         try:
-            if external_id_field:
-                # Use external ID to map records
-                # Query target records with external IDs
-                external_ids = [rec.get(external_id_field) for rec in source_records 
-                               if rec.get(external_id_field)]
-                
-                if external_ids:
-                    # Build SOQL query to get target records
-                    external_ids_str = "', '".join([str(eid) for eid in external_ids])
-                    soql = f"SELECT Id, {external_id_field} FROM {object_name} WHERE {external_id_field} IN ('{external_ids_str}')"
-                    
-                    result = self.target.query(soql)
-                    target_records = result['records']
-                    
-                    # Create mapping: external_id -> target_id
-                    external_id_mapping = {
-                        rec[external_id_field]: rec['Id'] 
-                        for rec in target_records
-                    }
-                    
-                    # Map source IDs to target IDs
-                    for source_record in source_records:
-                        source_id = source_record.get('Id')
-                        external_id_value = source_record.get(external_id_field)
-                        
-                        if source_id and external_id_value in external_id_mapping:
-                            self.id_mappings[object_name][source_id] = external_id_mapping[external_id_value]
-            else:
-                # If no external ID, we need a different approach
-                # This is more complex and might require querying based on multiple fields
-                # For simplicity, we'll implement a basic version here
-                logger.warning("ID mapping without external ID is limited - recommend using external IDs")
-                
-                # Create a mapping based on Name field (if it exists) for common objects
-                name_fields = ['Name', 'FirstName', 'LastName', 'Email']
-                for name_field in name_fields:
-                    names = [rec.get(name_field) for rec in source_records 
-                            if rec.get(name_field)]
-                    if names:
-                        try:
-                            names_str = "', '".join([str(name) for name in names])
-                            soql = f"SELECT Id, {name_field} FROM {object_name} WHERE {name_field} IN ('{names_str}')"
-                            result = self.target.query(soql)
-                            target_records = result['records']
-                            
-                            name_mapping = {
-                                rec[name_field]: rec['Id'] 
-                                for rec in target_records
-                            }
-                            
-                            for source_record in source_records:
-                                source_id = source_record.get('Id')
-                                name_value = source_record.get(name_field)
-                                
-                                if source_id and name_value in name_mapping:
-                                    self.id_mappings[object_name][source_id] = name_mapping[name_value]
-                            break  # Use first available name field
-                        except Exception as e:
-                            logger.debug(f"Could not map using {name_field}: {str(e)}")
-                            continue
+            # Check if object has a Name field
+            describe = getattr(self.source, object_name).describe()
+            name_field = None
             
-            logger.info(f"Created {len(self.id_mappings.get(object_name, {}))} ID mappings for {object_name}")
+            # Priority order for name-like fields
+            for field in describe['fields']:
+                if field['name'] == 'Name':
+                    name_field = 'Name'
+                    break
+                elif field['name'] == 'FirstName':
+                    name_field = 'FirstName'
+                elif field['name'] == 'LastName':
+                    name_field = 'LastName'
+            
+            if not name_field:
+                logger.warning(f"No Name field found for {object_name}, using ID mappings from batch results")
+                return
+            
+            # Get names from source records
+            names = [rec.get(name_field) for rec in source_records if rec.get(name_field)]
+            
+            if not names:
+                logger.warning(f"No names found in source records for {object_name}")
+                return
+            
+            # Build SOQL query to get target records by Name
+            names_str = "', '".join([str(name) for name in names])
+            soql = f"SELECT Id, {name_field} FROM {object_name} WHERE {name_field} IN ('{names_str}')"
+            
+            result = self.target.query(soql)
+            target_records = result['records']
+            
+            # Create mapping: name -> target_id
+            name_mapping = {
+                rec[name_field]: rec['Id'] 
+                for rec in target_records
+            }
+            
+            # Map source IDs to target IDs
+            mappings_created = 0
+            for source_record in source_records:
+                source_id = source_record.get('Id')
+                name_value = source_record.get(name_field)
+                
+                if source_id and name_value in name_mapping:
+                    self.id_mappings[object_name][source_id] = name_mapping[name_value]
+                    mappings_created += 1
+            
+            logger.info(f"Created {mappings_created} ID mappings for {object_name} using {name_field}")
             
         except Exception as e:
             logger.error(f"Error updating ID mappings: {str(e)}")
@@ -521,8 +589,8 @@ class SalesforceDataTransfer:
         Args:
             object_dependencies: List of dictionaries with object transfer info
                 Format: [
-                    {'object_name': 'Account', 'external_id_field': 'External_ID__c'},
-                    {'object_name': 'Contact', 'external_id_field': 'External_ID__c'},
+                    {'object_name': 'Account'},
+                    {'object_name': 'Contact'},
                 ]
             batch_size: Number of records to process in each batch
         
@@ -535,12 +603,12 @@ class SalesforceDataTransfer:
             'objects': {},
             'total_records': 0,
             'total_success': 0,
-            'total_failed': 0
+            'total_failed': 0,
+            'batches_processed': 0
         }
         
         for obj_config in object_dependencies:
             object_name = obj_config['object_name']
-            external_id_field = obj_config.get('external_id_field')
             query_fields = obj_config.get('query_fields')
             
             logger.info(f"\n{'='*60}")
@@ -551,7 +619,6 @@ class SalesforceDataTransfer:
                 stats = self.transfer_records(
                     object_name=object_name,
                     batch_size=batch_size,
-                    external_id_field=external_id_field,
                     query_fields=query_fields
                 )
                 
@@ -559,6 +626,7 @@ class SalesforceDataTransfer:
                 overall_stats['total_records'] += stats['total']
                 overall_stats['total_success'] += stats['success']
                 overall_stats['total_failed'] += stats['failed']
+                overall_stats['batches_processed'] += stats.get('batches_processed', 0)
                 
             except Exception as e:
                 logger.error(f"Failed to transfer {object_name}: {str(e)}")
@@ -573,6 +641,7 @@ class SalesforceDataTransfer:
         logger.info(f"Total Records: {overall_stats['total_records']}")
         logger.info(f"Total Success: {overall_stats['total_success']}")
         logger.info(f"Total Failed: {overall_stats['total_failed']}")
+        logger.info(f"Total Batches: {overall_stats['batches_processed']}")
         logger.info("="*60)
         
         return overall_stats
@@ -580,8 +649,7 @@ class SalesforceDataTransfer:
     def auto_transfer_all_objects(self, object_filter: List[str] = None,
                                  include_custom: bool = True,
                                  include_standard: bool = True,
-                                 batch_size: int = 50,
-                                 external_id_priority: List[str] = None) -> Dict:
+                                 batch_size: int = 50) -> Dict:
         """
         Automatically discover dependencies and transfer all objects in correct order
         
@@ -590,7 +658,6 @@ class SalesforceDataTransfer:
             include_custom: Include custom objects (__c suffix)
             include_standard: Include standard objects
             batch_size: Number of records to process in each batch
-            external_id_priority: Priority list for external ID field names
         
         Returns:
             Dictionary with overall transfer statistics and dependency information
@@ -624,19 +691,15 @@ class SalesforceDataTransfer:
         # Determine optimal transfer order using topological sort
         transfer_order = self.topological_sort(dependency_graph)
         
-        # Prepare object configurations with external ID detection
+        # Prepare object configurations
         object_dependencies = []
         for obj_name in transfer_order:
-            # Try to find external ID field
-            external_id_field = self.find_external_id_fields(obj_name)
-            
             obj_config = {
-                'object_name': obj_name,
-                'external_id_field': external_id_field
+                'object_name': obj_name
             }
             object_dependencies.append(obj_config)
             
-            logger.info(f"{obj_name} -> External ID: {external_id_field if external_id_field else 'None'}")
+            logger.info(f"{obj_name} -> Added to transfer queue")
         
         # Execute transfer in correct order
         results = self.transfer_objects_in_order(object_dependencies, batch_size)
@@ -673,7 +736,7 @@ def main():
         
         # OPTION 1: Automatic transfer with dependency discovery
         # This will automatically discover objects, their relationships, 
-        # and transfer them in the correct order
+        # and transfer them in the correct order using batch API
         
         # Example 1: Transfer all objects (custom and standard)
         results = transfer.auto_transfer_all_objects(
@@ -695,21 +758,18 @@ def main():
         #     batch_size=50
         # )
         
-        # OPTION 2: Manual transfer with explicit object list (legacy method)
+        # OPTION 2: Manual transfer with explicit object list
         # Define objects to transfer in dependency order (parents before children)
         # object_dependencies = [
         #     {
         #         'object_name': 'Account',
-        #         'external_id_field': 'External_ID__c',  # Use your external ID field
-        #         # 'query_fields': ['Id', 'Name', 'External_ID__c', 'BillingCity', 'BillingState']
+        #         # 'query_fields': ['Id', 'Name', 'BillingCity', 'BillingState']
         #     },
         #     {
         #         'object_name': 'Contact',
-        #         'external_id_field': 'External_ID__c',
         #     },
         #     {
         #         'object_name': 'Opportunity',
-        #         'external_id_field': 'External_ID__c',
         #     },
         # ]
         # results = transfer.transfer_objects_in_order(object_dependencies)
@@ -728,6 +788,7 @@ def main():
         logger.info(f"Total Records: {results.get('total_records', 0)}")
         logger.info(f"Successful: {results.get('total_success', 0)}")
         logger.info(f"Failed: {results.get('total_failed', 0)}")
+        logger.info(f"Total Batches Processed: {results.get('batches_processed', 0)}")
         
         if 'transfer_order' in results:
             logger.info(f"\nTransfer Order:")
