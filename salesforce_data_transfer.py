@@ -34,6 +34,9 @@ class SalesforceDataTransfer:
         # Store ID mappings for lookup field resolution
         self.id_mappings = {}  # Format: {object_name: {source_id: target_id}}
         
+        # Store RecordType mappings between source and target
+        self.record_type_mappings = {}  # Format: {object_name: {developer_name: target_id}}
+        
     def _connect(self, config: Dict, instance_name: str) -> Salesforce:
         """Establish connection to Salesforce instance"""
         logger.info(f"Connecting to {instance_name} sandbox...")
@@ -263,10 +266,131 @@ class SalesforceDataTransfer:
         except Exception as e:
             logger.error(f"Error updating ID mappings after batch: {str(e)}")
     
+    def get_record_types(self, sf: Salesforce, object_name: str) -> Dict:
+        """
+        Get all RecordTypes for a specific object from Salesforce
+        
+        Args:
+            sf: Salesforce connection object
+            object_name: Name of the Salesforce object
+        
+        Returns:
+            Dictionary mapping DeveloperName to RecordTypeId
+        """
+        logger.info(f"Retrieving RecordTypes for {object_name}...")
+        
+        try:
+            soql = f"""
+                SELECT Id, DeveloperName, Name, SobjectType, IsActive 
+                FROM RecordType 
+                WHERE SobjectType = '{object_name}' AND IsActive = true
+            """
+            result = sf.query(soql)
+            
+            record_types = {}
+            for rt in result['records']:
+                record_types[rt['DeveloperName']] = {
+                    'id': rt['Id'],
+                    'name': rt['Name'],
+                    'developer_name': rt['DeveloperName']
+                }
+            
+            logger.info(f"Found {len(record_types)} active RecordTypes for {object_name}")
+            return record_types
+            
+        except Exception as e:
+            logger.error(f"Error retrieving RecordTypes for {object_name}: {str(e)}")
+            return {}
+    
+    def build_record_type_mapping(self, object_name: str):
+        """
+        Build RecordType ID mapping between source and target systems
+        
+        Maps source RecordTypes to target RecordTypes using DeveloperName as the key
+        
+        Args:
+            object_name: Name of the Salesforce object
+        """
+        logger.info(f"Building RecordType mapping for {object_name}...")
+        
+        try:
+            # Get RecordTypes from both systems
+            source_record_types = self.get_record_types(self.source, object_name)
+            target_record_types = self.get_record_types(self.target, object_name)
+            
+            if not source_record_types or not target_record_types:
+                logger.warning(f"No RecordTypes found for {object_name}")
+                return
+            
+            # Map by DeveloperName
+            mapping = {}
+            matched = 0
+            missing = []
+            
+            for dev_name, source_rt in source_record_types.items():
+                if dev_name in target_record_types:
+                    mapping[dev_name] = target_record_types[dev_name]['id']
+                    matched += 1
+                    logger.debug(f"Mapped RecordType {dev_name}: {source_rt['id']} -> {target_record_types[dev_name]['id']}")
+                else:
+                    missing.append(dev_name)
+                    logger.warning(f"RecordType '{dev_name}' not found in target system for {object_name}")
+            
+            self.record_type_mappings[object_name] = mapping
+            
+            logger.info(f"RecordType mapping complete for {object_name}: {matched} matched, {len(missing)} missing")
+            
+            if missing:
+                logger.warning(f"Missing RecordTypes in target: {', '.join(missing)}")
+            
+        except Exception as e:
+            logger.error(f"Error building RecordType mapping: {str(e)}")
+    
+    def get_target_record_type_id(self, object_name: str, source_record_type_id: str) -> str:
+        """
+        Get the target RecordType ID for a source RecordType ID
+        
+        Args:
+            object_name: Name of the Salesforce object
+            source_record_type_id: Source RecordType ID
+        
+        Returns:
+            Target RecordType ID or None if not found
+        """
+        try:
+            if object_name not in self.record_type_mappings:
+                logger.debug(f"No RecordType mapping found for {object_name}")
+                return None
+            
+            # Find the source RecordType by ID
+            source_record_types = self.get_record_types(self.source, object_name)
+            source_dev_name = None
+            
+            for dev_name, rt_info in source_record_types.items():
+                if rt_info['id'] == source_record_type_id:
+                    source_dev_name = dev_name
+                    break
+            
+            if not source_dev_name:
+                logger.warning(f"Source RecordType ID {source_record_type_id} not found in {object_name}")
+                return None
+            
+            # Get target RecordType ID
+            target_mapping = self.record_type_mappings[object_name]
+            if source_dev_name in target_mapping:
+                return target_mapping[source_dev_name]
+            else:
+                logger.warning(f"RecordType '{source_dev_name}' not mapped in target for {object_name}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting target RecordType ID: {str(e)}")
+            return None
+    
     def prepare_record_for_insert(self, record: Dict, object_name: str, 
                                  lookup_fields: Dict) -> Dict:
         """
-        Prepare a record for insertion by handling lookup fields and filtering system fields
+        Prepare a record for insertion by handling lookup fields, RecordType, and filtering system fields
         
         Args:
             record: Source record dictionary
@@ -274,7 +398,7 @@ class SalesforceDataTransfer:
             lookup_fields: Dictionary of lookup fields and their referenced objects
         
         Returns:
-            Prepared record dictionary with updated lookup references
+            Prepared record dictionary with updated lookup references and RecordType mapping
         """
         prepared_record = {}
         
@@ -285,7 +409,7 @@ class SalesforceDataTransfer:
             'IsDeleted', 'SystemModstamp', 'LastViewedDate',
             'LastReferencedDate', 'JigsawContactId', 'JigsawCompanyId',
             'IsPartner', 'IsAccountDeleted', 'IsPersonAccount',
-            'MasterRecordId', 'RecordTypeId', 'OwnerChangeOption',
+            'MasterRecordId', 'OwnerChangeOption',
             'PhotoUrl', 'IndividualId', 'BillingGeocodeAccuracy',
             'ShippingGeocodeAccuracy', 'EmailBouncedReason',
             'EmailBouncedDate', 'LastActivityDate', 'LastCURequestDate',
@@ -303,6 +427,16 @@ class SalesforceDataTransfer:
             
             # Skip fields ending with common system patterns
             if any(field.endswith(suffix) for suffix in ['__s', '__pc', '__History', '__Feed', '__Share', '__Tag', '__Layout', '__Track']):
+                continue
+            
+            # Handle RecordType field specially - map to target RecordType ID
+            if field == 'RecordTypeId':
+                target_record_type_id = self.get_target_record_type_id(object_name, value)
+                if target_record_type_id:
+                    prepared_record[field] = target_record_type_id
+                    logger.debug(f"Mapped RecordTypeId: {value} -> {target_record_type_id}")
+                else:
+                    logger.warning(f"Could not map RecordTypeId {value} for {object_name}, skipping field")
                 continue
             
             # Handle lookup fields
@@ -353,6 +487,9 @@ class SalesforceDataTransfer:
         try:
             # Get lookup fields for this object
             lookup_fields = self.get_lookup_fields(self.source, object_name)
+            
+            # Build RecordType mappings for this object
+            self.build_record_type_mapping(object_name)
             
             # Retrieve source records
             source_records = self.get_all_records(
