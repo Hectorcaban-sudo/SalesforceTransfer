@@ -1,9 +1,9 @@
 import logging
 from simple_salesforce import Salesforce
-from simple_salesforce.exceptions import SalesforceMalformedRequest
 from collections import defaultdict, deque
 import sys
 import json
+import math
 
 # =====================================================
 # CONFIGURATION
@@ -57,9 +57,9 @@ try:
     source_sf = Salesforce(**SOURCE_CONFIG)
     target_sf = Salesforce(**TARGET_CONFIG)
     print("Connected to both sandboxes.")
-except Exception as e:
-    logging.critical("Connection failed", exc_info=True)
-    sys.exit("Salesforce connection failed.")
+except Exception:
+    logging.critical("Salesforce connection failed", exc_info=True)
+    sys.exit("Connection failed.")
 
 
 # =====================================================
@@ -67,12 +67,10 @@ except Exception as e:
 # =====================================================
 
 def get_safe_fields(sf, object_name):
-
     desc = sf.__getattr__(object_name).describe()
     safe_fields = []
 
     for field in desc["fields"]:
-
         if not field["createable"]:
             continue
         if field["calculated"]:
@@ -80,14 +78,9 @@ def get_safe_fields(sf, object_name):
         if field["autoNumber"]:
             continue
         if field["name"] in [
-            "Id",
-            "CreatedDate",
-            "CreatedById",
-            "LastModifiedDate",
-            "LastModifiedById",
-            "SystemModstamp",
-            "IsDeleted",
-            "IsPartner",
+            "Id", "CreatedDate", "CreatedById",
+            "LastModifiedDate", "LastModifiedById",
+            "SystemModstamp", "IsDeleted", "IsPartner"
         ]:
             continue
         if not MIGRATE_OWNER and field["name"] == "OwnerId":
@@ -193,16 +186,23 @@ def migrate():
     for obj in migration_order:
 
         print(f"\nMigrating {obj}...")
+        logging.info(f"Starting object: {obj}")
+
+        stats = {
+            "processed": 0,
+            "inserted": 0,
+            "updated": 0,
+            "success": 0,
+            "failed": 0
+        }
 
         try:
             fields = get_safe_fields(source_sf, obj)
-
             if "Name" not in fields:
                 print(f"Skipping {obj} (no Name field)")
                 continue
 
             lookup_fields = get_lookup_fields(source_sf, obj)
-
             source_records = fetch_source_records(obj, fields)
             target_name_map = fetch_target_name_map(obj)
 
@@ -210,11 +210,10 @@ def migrate():
             update_list = []
 
             for record in source_records:
-
+                stats["processed"] += 1
                 source_id = record["Id"]
                 record.pop("attributes", None)
                 record.pop("Id", None)
-
                 record = remap_lookup_ids(record, lookup_fields, id_map)
 
                 if record["Name"] in target_name_map:
@@ -223,51 +222,93 @@ def migrate():
                 else:
                     insert_list.append((source_id, record))
 
-            # =============================
-            # BULK INSERT
-            # =============================
+            total_operations = len(insert_list) + len(update_list)
+            print(f"Total operations for {obj}: {total_operations}")
 
-            for batch in chunk_list(insert_list, BATCH_SIZE):
+            # ================= INSERT =================
+            total_batches = math.ceil(len(insert_list) / BATCH_SIZE)
+            for batch_num, batch in enumerate(chunk_list(insert_list, BATCH_SIZE), start=1):
+
+                remaining = len(insert_list) - (batch_num * BATCH_SIZE)
+                remaining = max(0, remaining)
+
+                print(f"[{obj}] INSERT Batch {batch_num}/{total_batches} "
+                      f"Size: {len(batch)} Remaining Inserts: {remaining}")
+
+                logging.info(f"{obj} INSERT Batch {batch_num}/{total_batches} | Remaining: {remaining}")
 
                 payload = [r[1] for r in batch]
-
                 results = target_sf.bulk.__getattr__(obj).insert(payload)
+
+                batch_success = 0
+                batch_fail = 0
 
                 for i, result in enumerate(results):
                     source_id = batch[i][0]
 
                     if result["success"]:
+                        batch_success += 1
+                        stats["inserted"] += 1
+                        stats["success"] += 1
                         id_map[source_id] = result["id"]
                     else:
+                        batch_fail += 1
+                        stats["failed"] += 1
                         failure_logger.error(json.dumps({
                             "object": obj,
                             "operation": "insert",
-                            "errors": result["errors"]
+                            "errors": result["errors"],
+                            "record": batch[i][1]
                         }))
 
-            # =============================
-            # BULK UPDATE
-            # =============================
+                print(f"   → Batch Result: Success={batch_success} Failed={batch_fail}")
 
-            for batch in chunk_list(update_list, BATCH_SIZE):
+            # ================= UPDATE =================
+            total_batches = math.ceil(len(update_list) / BATCH_SIZE)
+            for batch_num, batch in enumerate(chunk_list(update_list, BATCH_SIZE), start=1):
+
+                remaining = len(update_list) - (batch_num * BATCH_SIZE)
+                remaining = max(0, remaining)
+
+                print(f"[{obj}] UPDATE Batch {batch_num}/{total_batches} "
+                      f"Size: {len(batch)} Remaining Updates: {remaining}")
+
+                logging.info(f"{obj} UPDATE Batch {batch_num}/{total_batches} | Remaining: {remaining}")
 
                 payload = [r[1] for r in batch]
-
                 results = target_sf.bulk.__getattr__(obj).update(payload)
+
+                batch_success = 0
+                batch_fail = 0
 
                 for i, result in enumerate(results):
                     source_id = batch[i][0]
 
                     if result["success"]:
+                        batch_success += 1
+                        stats["updated"] += 1
+                        stats["success"] += 1
                         id_map[source_id] = result["id"]
                     else:
+                        batch_fail += 1
+                        stats["failed"] += 1
                         failure_logger.error(json.dumps({
                             "object": obj,
                             "operation": "update",
-                            "errors": result["errors"]
+                            "errors": result["errors"],
+                            "record": batch[i][1]
                         }))
 
-            print(f"Finished {obj}")
+                print(f"   → Batch Result: Success={batch_success} Failed={batch_fail}")
+
+            print(
+                f"{obj} COMPLETE → "
+                f"Processed={stats['processed']} "
+                f"Inserted={stats['inserted']} "
+                f"Updated={stats['updated']} "
+                f"Success={stats['success']} "
+                f"Failed={stats['failed']}"
+            )
 
         except Exception:
             logging.error(f"Unexpected failure for {obj}", exc_info=True)
