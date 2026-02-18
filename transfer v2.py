@@ -173,9 +173,42 @@ def chunk_list(data, size):
 
 
 def remap_lookup_ids(record, lookup_fields, id_map):
-    for field in lookup_fields:
-        if record.get(field) and record[field] in id_map:
-            record[field] = id_map[record[field]]
+
+    for field, parent_objects in lookup_fields.items():
+
+        if not record.get(field):
+            continue
+
+        source_parent_id = record[field]
+
+        # If parent created in this run
+        if source_parent_id in id_map:
+            record[field] = id_map[source_parent_id]
+            continue
+
+        # Otherwise resolve via Name matching
+        parent_object = parent_objects[0]  # Usually one object type
+
+        # Build target cache
+        target_map = build_target_parent_map(parent_object)
+
+        # Get source parent name
+        source_name_map = get_source_parent_names(parent_object, [source_parent_id])
+
+        if source_parent_id not in source_name_map:
+            logging.warning(f"Source parent not found for {parent_object}: {source_parent_id}")
+            continue
+
+        parent_name = source_name_map[source_parent_id]
+
+        if parent_name in target_map:
+            record[field] = target_map[parent_name]
+        else:
+            logging.warning(
+                f"Target parent not found: {parent_object} → {parent_name}"
+            )
+            record.pop(field, None)  # remove invalid lookup
+
     return record
 
 
@@ -246,8 +279,49 @@ def remap_recordtype(record, object_name, target_rt_map):
 
     return record
 
+def build_target_parent_map(object_name):
+
+    if object_name in target_parent_cache:
+        return target_parent_cache[object_name]
+
+    try:
+        query = f"SELECT Id, Name FROM {object_name}"
+        records = target_sf.query_all(query)["records"]
+
+        name_map = {r["Name"]: r["Id"] for r in records}
+        target_parent_cache[object_name] = name_map
+
+        logging.info(f"Built target parent cache for {object_name}")
+        return name_map
+
+    except Exception:
+        logging.error(f"Failed building target parent map for {object_name}", exc_info=True)
+        return {}
+
+def get_source_parent_names(object_name, ids):
+
+    if not ids:
+        return {}
+
+    try:
+        id_list = ",".join([f"'{i}'" for i in ids])
+        query = f"SELECT Id, Name FROM {object_name} WHERE Id IN ({id_list})"
+        records = source_sf.query_all(query)["records"]
+
+        return {r["Id"]: r["Name"] for r in records}
+
+    except Exception:
+        logging.error(f"Failed querying source parent names for {object_name}", exc_info=True)
+        return {}
+
 
 def migrate():
+    # Cache: { object_name : { source_id : parent_name } }
+    source_parent_cache = defaultdict(dict)
+
+    # Cache: { object_name : { parent_name : target_id } }
+    target_parent_cache = defaultdict(dict)
+
     target_recordtype_map = build_target_recordtype_map()
 
     id_map = {}
