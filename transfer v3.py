@@ -64,32 +64,50 @@ def get_fields_and_lookups(sf, obj):
 # ---------------- DEPENDENCY ORDER ----------------
 
 def build_dependency_graph(sf, objects):
-    graph = defaultdict(set)
+    # Every object must exist in graph
+    graph = {obj: set() for obj in objects}
+
     for obj in objects:
         _, lookups = get_fields_and_lookups(sf, obj)
+
         for parent in lookups.values():
-            if parent in objects:
+            if parent in objects and parent != obj:
+                # child depends on parent
                 graph[obj].add(parent)
+
     return graph
 
 
 def topo_sort(graph):
-    indeg = defaultdict(int)
-    for node in graph:
-        for dep in graph[node]:
-            indeg[dep]+=1
+    # Kahn’s Algorithm
+    indegree = {node: 0 for node in graph}
 
-    q = deque([n for n in graph if indeg[n]==0])
-    ordered=[]
-    while q:
-        n=q.popleft()
-        ordered.append(n)
-        for m in graph:
-            if n in graph[m]:
-                indeg[m]-=1
-                if indeg[m]==0:
-                    q.append(m)
-    return ordered
+    # child depends on parent -> increase child indegree
+    for child, parents in graph.items():
+        for parent in parents:
+            indegree[child] += 1
+
+    # start with parents (no dependencies)
+    queue = deque([n for n, deg in indegree.items() if deg == 0])
+    order = []
+
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+
+        # remove node as dependency from others
+        for other in graph:
+            if node in graph[other]:
+                indegree[other] -= 1
+                if indegree[other] == 0:
+                    queue.append(other)
+
+    # circular dependency safety (Salesforce self lookups etc)
+    if len(order) != len(graph):
+        print("WARNING: circular dependencies detected — using original order")
+        return list(graph.keys())
+
+    return order
 
 # ---------------- QUERY SOURCE ----------------
 
