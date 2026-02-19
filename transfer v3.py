@@ -41,9 +41,11 @@ class TransferLogger:
         self.success = 0
         self.skipped = 0
         self.failed = 0
+        self.inserted = 0
+        self.updated = 0
 
     def summary(self):
-        logging.info(f"SUCCESS: {self.success}  SKIPPED: {self.skipped}  FAILED: {self.failed}")
+        logging.info(f"SUCCESS: {self.success}  INSERTED: {self.inserted}  UPDATED: {self.updated}  SKIPPED: {self.skipped}  FAILED: {self.failed}")
 
 
 class SalesforceTransfer:
@@ -142,16 +144,60 @@ class SalesforceTransfer:
         if not records:
             return
 
-        batches = [records[i:i+BATCH_SIZE] for i in range(0, len(records), BATCH_SIZE)]
+        # split insert vs update based on Name match (natural key fallback since no external id allowed)
+        inserts = []
+        updates = []
 
-        for batch_num, batch in enumerate(batches, start=1):
-            logging.info(f"{obj} Batch {batch_num}/{len(batches)} size={len(batch)}")
-            results = getattr(self.tgt.bulk, obj).insert(batch, batch_size=BATCH_SIZE)
+        for r in records:
+            source_id = r['_sourceId']
+            payload = dict(r)
+            payload.pop('_sourceId', None)
 
-            for rec, res in zip(batch, results):
-                if res['success']:
-                    self.logger.success += 1
-                    self.id_map[obj][rec['_sourceId']] = res['id']
+            name = payload.get('Name')
+            target_id = None
+            if name:
+                try:
+                    result = self.tgt.query(f"SELECT Id FROM {obj} WHERE Name = '{name.replace("'","\'")}' LIMIT 1")
+                    if result['records']:
+                        target_id = result['records'][0]['Id']
+                except Exception:
+                    pass
+
+            if target_id:
+                payload['Id'] = target_id
+                updates.append((source_id, payload, target_id))
+            else:
+                inserts.append((source_id, payload))
+
+        # ----- INSERTS -----
+        if inserts:
+            insert_batches = [inserts[i:i+BATCH_SIZE] for i in range(0, len(inserts), BATCH_SIZE)]
+            for i, batch in enumerate(insert_batches, start=1):
+                logging.info(f"{obj} INSERT batch {i}/{len(insert_batches)} size={len(batch)}")
+                batch_records = [p for _, p in batch]
+                results = getattr(self.tgt.bulk, obj).insert(batch_records, batch_size=BATCH_SIZE)
+                for (source_id, _), res in zip(batch, results):
+                    if res['success']:
+                        self.logger.success += 1
+                        self.logger.inserted += 1
+                        self.id_map[obj][source_id] = res['id']
+                    else:
+                        self.logger.failed += 1
+
+        # ----- UPDATES -----
+        if updates:
+            update_batches = [updates[i:i+BATCH_SIZE] for i in range(0, len(updates), BATCH_SIZE)]
+            for i, batch in enumerate(update_batches, start=1):
+                logging.info(f"{obj} UPDATE batch {i}/{len(update_batches)} size={len(batch)}")
+                batch_records = [p for _, p, _ in batch]
+                results = getattr(self.tgt.bulk, obj).update(batch_records, batch_size=BATCH_SIZE)
+                for (source_id, _, target_id), res in zip(batch, results):
+                    if res['success']:
+                        self.logger.success += 1
+                        self.logger.updated += 1
+                        self.id_map[obj][source_id] = target_id
+                    else:
+                        self.logger.failed += 1
                 else:
                     self.logger.failed += 1
 
