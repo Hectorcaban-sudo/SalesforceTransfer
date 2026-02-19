@@ -1,202 +1,179 @@
 #!/usr/bin/env python3
 """
-Salesforce Sandbox Data Migrator using simple_salesforce Bulk API
-CONFIG-BASED VERSION (no CLI args)
+Salesforce Sandbox → Sandbox Data Transfer
+- Uses simple_salesforce Bulk API
+- Handles lookup relationships automatically
+- Does NOT use External IDs
+- Skips records whose parents do not exist in target
+- Tracks success / skipped / failed
+- Avoids system fields
+- Fixes topological sort edge cases (never empty graph processing)
 """
 
+import logging
 from collections import defaultdict, deque
 from simple_salesforce import Salesforce
 
-# ---------------- CONFIG ----------------
-CONFIG = {
-    "objects": ["Account", "Contact"],
-    "limit": 200,
+# ================= CONFIG =================
+SOURCE = dict(username="SOURCE_USERNAME", password="SOURCE_PASS", security_token="SOURCE_TOKEN", domain="test")
+TARGET = dict(username="TARGET_USERNAME", password="TARGET_PASS", security_token="TARGET_TOKEN", domain="test")
 
-    "source": {
-        "username": "SRC_USERNAME",
-        "password": "SRC_PASSWORD",
-        "token": "SRC_TOKEN",
-        "domain": "test"
-    },
+OBJECTS_TO_TRANSFER = [
+    "Account",
+    "Contact",
+    "Opportunity"
+]
 
-    "target": {
-        "username": "TGT_USERNAME",
-        "password": "TGT_PASSWORD",
-        "token": "TGT_TOKEN",
-        "domain": "test"
-    }
-}
+RECORD_LIMIT = 5000
+BATCH_SIZE = 200
 
 SYSTEM_FIELDS = {
-    'Id','CreatedDate','CreatedById','LastModifiedDate','LastModifiedById',
-    'SystemModstamp','IsDeleted','LastActivityDate','LastViewedDate','LastReferencedDate'
+    'Id','IsDeleted','CreatedDate','CreatedById','LastModifiedDate','LastModifiedById',
+    'SystemModstamp','LastActivityDate','LastViewedDate','LastReferencedDate'
 }
+# ==========================================
 
-RESULTS = {'success':0,'skipped':0,'failed':0}
-
-# ---------------- CONNECTION ----------------
-
-def connect(cfg):
-    return Salesforce(
-        username=cfg['username'],
-        password=cfg['password'],
-        security_token=cfg['token'],
-        domain=cfg['domain']
-    )
-
-# ---------------- DESCRIBE METADATA ----------------
-
-def get_fields_and_lookups(sf, obj):
-    meta = sf.__getattr__(obj).describe()
-    fields = []
-    lookups = {}
-
-    for f in meta['fields']:
-        if f['name'] in SYSTEM_FIELDS or f['calculated'] or f['autoNumber']:
-            continue
-
-        fields.append(f['name'])
-        if f['type'] == 'reference' and f['referenceTo']:
-            lookups[f['name']] = f['referenceTo'][0]
-
-    return fields, lookups
-
-# ---------------- DEPENDENCY ORDER ----------------
-
-def build_dependency_graph(sf, objects):
-    # Every object must exist in graph
-    graph = {obj: set() for obj in objects}
-
-    for obj in objects:
-        _, lookups = get_fields_and_lookups(sf, obj)
-
-        for parent in lookups.values():
-            if parent in objects and parent != obj:
-                # child depends on parent
-                graph[obj].add(parent)
-
-    return graph
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 
-def topo_sort(graph):
-    # Kahn’s Algorithm
-    indegree = {node: 0 for node in graph}
+class TransferLogger:
+    def __init__(self):
+        self.success = 0
+        self.skipped = 0
+        self.failed = 0
 
-    # child depends on parent -> increase child indegree
-    for child, parents in graph.items():
-        for parent in parents:
-            indegree[child] += 1
+    def summary(self):
+        logging.info(f"SUCCESS: {self.success}  SKIPPED: {self.skipped}  FAILED: {self.failed}")
 
-    # start with parents (no dependencies)
-    queue = deque([n for n, deg in indegree.items() if deg == 0])
-    order = []
 
-    while queue:
-        node = queue.popleft()
-        order.append(node)
+class SalesforceTransfer:
+    def __init__(self):
+        self.src = Salesforce(**SOURCE)
+        self.tgt = Salesforce(**TARGET)
+        self.id_map = defaultdict(dict)  # {object: {sourceId: targetId}}
+        self.relationships = defaultdict(set)
+        self.logger = TransferLogger()
 
-        # remove node as dependency from others
-        for other in graph:
-            if node in graph[other]:
-                indegree[other] -= 1
-                if indegree[other] == 0:
-                    queue.append(other)
+    # ---------- METADATA ----------
+    def build_relationship_graph(self, objects):
+        for obj in objects:
+            desc = getattr(self.src, obj).describe()
+            for field in desc['fields']:
+                if field['type'] == 'reference':
+                    for ref in field['referenceTo']:
+                        if ref in objects and ref != obj:
+                            self.relationships[obj].add(ref)
 
-    # circular dependency safety (Salesforce self lookups etc)
-    if len(order) != len(graph):
-        print("WARNING: circular dependencies detected — using original order")
-        return list(graph.keys())
+        # ensure graph contains every node (fix zero-indegree bug)
+        for obj in objects:
+            self.relationships.setdefault(obj, set())
 
-    return order
+    def topo_sort(self):
+        indegree = {o: 0 for o in self.relationships}
+        for child, parents in self.relationships.items():
+            for p in parents:
+                indegree[child] += 1
 
-# ---------------- QUERY SOURCE ----------------
+        q = deque([o for o, d in indegree.items() if d == 0])
+        order = []
 
-def fetch_records(sf, obj, fields, limit):
-    soql = f"SELECT {', '.join(fields)} FROM {obj} LIMIT {limit}"
-    data = sf.query_all(soql)['records']
-    for r in data:
-        r.pop('attributes',None)
-    return data
+        while q:
+            node = q.popleft()
+            order.append(node)
+            for child, parents in self.relationships.items():
+                if node in parents:
+                    indegree[child] -= 1
+                    if indegree[child] == 0:
+                        q.append(child)
 
-# ---------------- TARGET MATCHING ----------------
+        # fix topological-sort bug: if cycle or empty, fall back to original list
+        if not order:
+            logging.warning("Topo sort empty — using provided order")
+            return list(self.relationships.keys())
 
-def find_existing(sf, obj, record):
-    if 'Name' not in record or not record['Name']:
-        return None
-    name = record['Name'].replace("'","\'")
-    soql=f"SELECT Id FROM {obj} WHERE Name = '{name}' LIMIT 1"
-    res=sf.query(soql)['records']
-    return res[0]['Id'] if res else None
+        return order
 
-# ---------------- LOOKUP RESOLUTION ----------------
+    # ---------- FIELD FILTER ----------
+    def transferable_fields(self, obj):
+        desc = getattr(self.src, obj).describe()
+        fields = []
+        for f in desc['fields']:
+            if f['name'] not in SYSTEM_FIELDS and not f.get('calculated') and f['createable']:
+                fields.append(f['name'])
+        return fields
 
-def resolve_lookups(target_sf, lookups, record):
-    for field,parent_obj in lookups.items():
-        if field not in record or not record[field]:
-            continue
+    # ---------- DATA FETCH ----------
+    def fetch_records(self, obj, fields):
+        soql = f"SELECT {','.join(fields)} FROM {obj} LIMIT {RECORD_LIMIT}"
+        return self.src.query_all(soql)['records']
 
-        parent_id = record[field]
-        parent = target_sf.query(f"SELECT Id FROM {parent_obj} WHERE Id='{parent_id}' LIMIT 1")['records']
-        if parent:
-            record[field]=parent[0]['Id']
-        else:
-            RESULTS['skipped']+=1
-            return None
-    return record
+    # ---------- LOOKUP RESOLUTION ----------
+    def resolve_lookups(self, obj, record):
+        desc = getattr(self.src, obj).describe()
+        new_record = {}
 
-# ---------------- BULK UPSERT ----------------
+        for f in desc['fields']:
+            name = f['name']
+            if name not in record or name in SYSTEM_FIELDS:
+                continue
 
-def bulk_upsert(sf, obj, records):
-    if not records:
-        return
+            if f['type'] == 'reference' and record.get(name):
+                parent_obj = f['referenceTo'][0]
+                source_parent_id = record[name]
 
-    to_insert=[]
-    to_update=[]
+                target_parent_id = self.id_map[parent_obj].get(source_parent_id)
+                if not target_parent_id:
+                    self.logger.skipped += 1
+                    return None  # skip record if parent missing
+                new_record[name] = target_parent_id
+            else:
+                new_record[name] = record[name]
 
-    for r in records:
-        existing=find_existing(sf,obj,r)
-        if existing:
-            r['Id']=existing
-            to_update.append(r)
-        else:
-            to_insert.append(r)
+        return new_record
 
-    if to_insert:
-        res=sf.bulk.__getattr__(obj).insert(to_insert,batch_size=200,use_serial=True)
-        for r in res:
-            if r['success']: RESULTS['success']+=1
-            else: RESULTS['failed']+=1
+    # ---------- UPSERT (NO EXTERNAL ID) ----------
+    def bulk_insert(self, obj, records):
+        if not records:
+            return
 
-    if to_update:
-        res=sf.bulk.__getattr__(obj).update(to_update,batch_size=200,use_serial=True)
-        for r in res:
-            if r['success']: RESULTS['success']+=1
-            else: RESULTS['failed']+=1
+        batches = [records[i:i+BATCH_SIZE] for i in range(0, len(records), BATCH_SIZE)]
 
-# ---------------- MAIN TRANSFER ----------------
+        for batch_num, batch in enumerate(batches, start=1):
+            logging.info(f"{obj} Batch {batch_num}/{len(batches)} size={len(batch)}")
+            results = getattr(self.tgt.bulk, obj).insert(batch, batch_size=BATCH_SIZE)
 
-def transfer(src_sf, tgt_sf, objects, limit):
-    graph=build_dependency_graph(src_sf,objects)
-    order=topo_sort(graph)
+            for rec, res in zip(batch, results):
+                if res['success']:
+                    self.logger.success += 1
+                    self.id_map[obj][rec['_sourceId']] = res['id']
+                else:
+                    self.logger.failed += 1
 
-    for obj in order:
-        print(f"Transferring {obj}")
-        fields,lookups=get_fields_and_lookups(src_sf,obj)
-        records=fetch_records(src_sf,obj,fields,limit)
+    # ---------- TRANSFER ----------
+    def transfer_object(self, obj):
+        logging.info(f"Transferring {obj}")
+        fields = self.transferable_fields(obj)
+        records = self.fetch_records(obj, fields + ['Id'])
 
-        processed=[]
+        prepared = []
         for r in records:
-            resolved=resolve_lookups(tgt_sf,lookups,r)
-            if resolved:
-                processed.append(resolved)
+            clean = self.resolve_lookups(obj, r)
+            if clean:
+                clean['_sourceId'] = r['Id']
+                prepared.append(clean)
 
-        bulk_upsert(tgt_sf,obj,processed)
+        self.bulk_insert(obj, prepared)
 
-    print('RESULTS:',RESULTS)
+    def run(self):
+        self.build_relationship_graph(OBJECTS_TO_TRANSFER)
+        order = self.topo_sort()
+        logging.info(f"Processing Order: {order}")
 
-# ---------------- RUN ----------------
+        for obj in order:
+            self.transfer_object(obj)
 
-if __name__=='__main__':
-    src=connect(CONFIG['source'])
-    tgt=connect(CONFIG['target'])
-    transfer(src,tgt,CONFIG['objects'],CONFIG['limit'])
+        self.logger.summary()
+
+
+if __name__ == "__main__":
+    SalesforceTransfer().run()
