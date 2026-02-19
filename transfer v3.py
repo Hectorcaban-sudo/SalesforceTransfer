@@ -117,14 +117,20 @@ class SalesforceTransfer:
             if name not in record or name in SYSTEM_FIELDS:
                 continue
 
+            # Only enforce lookup remap if the parent object is part of the transfer set
             if f['type'] == 'reference' and record.get(name):
                 parent_obj = f['referenceTo'][0]
                 source_parent_id = record[name]
 
+                # If parent object is NOT part of transfer, leave value empty (avoid invalid cross‑org ids)
+                if parent_obj not in self.relationships:
+                    continue
+
                 target_parent_id = self.id_map[parent_obj].get(source_parent_id)
                 if not target_parent_id:
+                    # parent not migrated yet → skip record safely
                     self.logger.skipped += 1
-                    return None  # skip record if parent missing
+                    return None
                 new_record[name] = target_parent_id
             else:
                 new_record[name] = record[name]
