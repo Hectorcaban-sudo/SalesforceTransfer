@@ -107,7 +107,11 @@ class SalesforceTransfer:
     # ---------- DATA FETCH ----------
     def fetch_records(self, obj, fields):
         soql = f"SELECT {','.join(fields)} FROM {obj} LIMIT {RECORD_LIMIT}"
-        return self.src.query_all(soql)['records']
+        try:
+            return self.src.query_all(soql)['records']
+        except Exception as e:
+            logging.exception(f"Failed fetching {obj}: {e}")
+            return []
 
     # ---------- LOOKUP RESOLUTION ----------
     def resolve_lookups(self, obj, record):
@@ -175,7 +179,12 @@ class SalesforceTransfer:
             for i, batch in enumerate(insert_batches, start=1):
                 logging.info(f"{obj} INSERT batch {i}/{len(insert_batches)} size={len(batch)}")
                 batch_records = [p for _, p in batch]
+                try:
                 results = getattr(self.tgt.bulk, obj).insert(batch_records, batch_size=BATCH_SIZE)
+            except Exception as e:
+                logging.exception(f"Bulk INSERT failure {obj}: {e}")
+                self.logger.failed += len(batch)
+                continue
                 for (source_id, _), res in zip(batch, results):
                     if res['success']:
                         self.logger.success += 1
@@ -190,7 +199,12 @@ class SalesforceTransfer:
             for i, batch in enumerate(update_batches, start=1):
                 logging.info(f"{obj} UPDATE batch {i}/{len(update_batches)} size={len(batch)}")
                 batch_records = [p for _, p, _ in batch]
+                try:
                 results = getattr(self.tgt.bulk, obj).update(batch_records, batch_size=BATCH_SIZE)
+            except Exception as e:
+                logging.exception(f"Bulk UPDATE failure {obj}: {e}")
+                self.logger.failed += len(batch)
+                continue
                 for (source_id, _, target_id), res in zip(batch, results):
                     if res['success']:
                         self.logger.success += 1
@@ -204,28 +218,90 @@ class SalesforceTransfer:
     # ---------- TRANSFER ----------
     def transfer_object(self, obj):
         logging.info(f"Transferring {obj}")
-        fields = self.transferable_fields(obj)
-        records = self.fetch_records(obj, fields + ['Id'])
+        self.disable_automation(obj)
+        try:
+            fields = self.transferable_fields(obj)
+            records = self.fetch_records(obj, fields + ['Id'])
 
-        prepared = []
-        for r in records:
-            clean = self.resolve_lookups(obj, r)
-            if clean:
-                clean['_sourceId'] = r['Id']
-                prepared.append(clean)
+            prepared = []
+            for r in records:
+                clean = self.resolve_lookups(obj, r)
+                if clean:
+                    clean['_sourceId'] = r['Id']
+                    prepared.append(clean)
 
-        self.bulk_insert(obj, prepared)
+            self.bulk_insert(obj, prepared)
+        finally:
+            self.enable_automation(obj)
 
     def run(self):
-        self.build_relationship_graph(OBJECTS_TO_TRANSFER)
-        order = self.topo_sort()
-        logging.info(f"Processing Order: {order}")
+        try:
+            self.build_relationship_graph(OBJECTS_TO_TRANSFER)
+            order = self.topo_sort()
+            logging.info(f"Processing Order: {order}")
 
-        for obj in order:
-            self.transfer_object(obj)
+            for obj in order:
+                try:
+                    self.transfer_object(obj)
+                except Exception as e:
+                    logging.exception(f"Object failed: {obj} -> {e}")
+            self.logger.summary()
+        except Exception as e:
+            logging.exception(f"Fatal migration error: {e}")
+            self.logger.summary()
 
-        self.logger.summary()
 
+    # ---------- AUTOMATION CONTROL (Tooling API) ----------
+    def _tooling(self, method, url, json=None):
+        import requests
+        base = self.tgt.sf_instance
+        sid = self.tgt.session_id
+        full = f"https://{base}{url}"
+        headers = {"Authorization": f"Bearer {sid}", "Content-Type": "application/json"}
+        try:
+            r = requests.request(method, full, headers=headers, json=json, timeout=60)
+            if not r.ok:
+                logging.warning(f"Tooling API call failed {method} {url}: {r.text}")
+            return r.json() if r.text else {}
+        except Exception as e:
+            logging.exception(f"Tooling API exception {method} {url}: {e}")
+            return {}
+
+    def disable_automation(self, obj):
+        logging.info(f"Disabling automation for {obj}")
+        # Validation Rules
+        q = f"/services/data/v59.0/tooling/query/?q=SELECT+Id,Active+FROM+ValidationRule+WHERE+EntityDefinition.QualifiedApiName='{obj}'+AND+Active=true"
+        res = self._tooling('GET', q)
+        for rec in res.get('records', []):
+            self._tooling('PATCH', f"/services/data/v59.0/tooling/sobjects/ValidationRule/{rec['Id']}", {"Metadata": {"active": False}})
+        # Triggers
+        q = f"/services/data/v59.0/tooling/query/?q=SELECT+Id,Status+FROM+ApexTrigger+WHERE+TableEnumOrId='{obj}'+AND+Status='Active'"
+        res = self._tooling('GET', q)
+        for rec in res.get('records', []):
+            self._tooling('PATCH', f"/services/data/v59.0/tooling/sobjects/ApexTrigger/{rec['Id']}", {"Status": "Inactive"})
+        # Flows
+        q = f"/services/data/v59.0/tooling/query/?q=SELECT+Id,ActiveVersionNumber+FROM+FlowDefinition+WHERE+DeveloperName='{obj}'"
+        res = self._tooling('GET', q)
+        for rec in res.get('records', []):
+            self._tooling('PATCH', f"/services/data/v59.0/tooling/sobjects/FlowDefinition/{rec['Id']}", {"ActiveVersionNumber": 0})
+
+    def enable_automation(self, obj):
+        logging.info(f"Re-enabling automation for {obj}")
+        # Validation Rules
+        q = f"/services/data/v59.0/tooling/query/?q=SELECT+Id,Active+FROM+ValidationRule+WHERE+EntityDefinition.QualifiedApiName='{obj}'"
+        res = self._tooling('GET', q)
+        for rec in res.get('records', []):
+            self._tooling('PATCH', f"/services/data/v59.0/tooling/sobjects/ValidationRule/{rec['Id']}", {"Metadata": {"active": True}})
+        # Triggers
+        q = f"/services/data/v59.0/tooling/query/?q=SELECT+Id,Status+FROM+ApexTrigger+WHERE+TableEnumOrId='{obj}'"
+        res = self._tooling('GET', q)
+        for rec in res.get('records', []):
+            self._tooling('PATCH', f"/services/data/v59.0/tooling/sobjects/ApexTrigger/{rec['Id']}", {"Status": "Active"})
+        # Flows (cannot restore exact version easily — reactivate latest)
+        q = f"/services/data/v59.0/tooling/query/?q=SELECT+Id,LatestVersionNumber+FROM+FlowDefinition+WHERE+DeveloperName='{obj}'"
+        res = self._tooling('GET', q)
+        for rec in res.get('records', []):
+            self._tooling('PATCH', f"/services/data/v59.0/tooling/sobjects/FlowDefinition/{rec['Id']}", {"ActiveVersionNumber": rec.get('LatestVersionNumber', 0)})
 
 if __name__ == "__main__":
     SalesforceTransfer().run()
