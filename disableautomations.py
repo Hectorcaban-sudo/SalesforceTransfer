@@ -6,96 +6,95 @@ SF_USERNAME = 'your_username'
 SF_PASSWORD = 'your_password'
 SF_TOKEN = 'your_security_token'
 SF_INSTANCE = 'login' 
-CACHE_FILE = 'automation_cache.json'
+CACHE_FILE = 'opp_automation_backup.json'
 
 sf = Salesforce(username=SF_USERNAME, password=SF_PASSWORD, security_token=SF_TOKEN, domain=SF_INSTANCE)
 
-def get_active_automation():
-    """
-    Scans for active Triggers and Flows related to Opportunity.
-    """
-    cache_data = {"ApexTrigger": [], "Flow": []}
-    
-    # --- Part 1: Apex Triggers ---
-    print("Searching for Apex Triggers...")
-    triggers = sf.mdapi.list_metadata(queries=[{'type': 'ApexTrigger'}])
-    # Filter for Opportunity triggers (requires reading metadata to check TableName)
-    trigger_names = [t['fullName'] for t in triggers]
-    if trigger_names:
-        # Read in chunks of 10 to be safe with API limits
-        details = sf.mdapi.ApexTrigger.read(trigger_names)
-        if isinstance(details, dict): details = [details]
-        
-        for t in details:
-            # Check if it belongs to Opportunity and is currently Active
-            if t.get('entityId') == 'Opportunity' and t.get('status') == 'Active':
-                cache_data["ApexTrigger"].append(t['fullName'])
+def get_active_elements():
+    """Finds only Opportunity-specific active automation."""
+    cache = {"ValidationRules": [], "Triggers": [], "Flows": []}
 
-    # --- Part 2: Flows (Includes Flow Triggers / Record-Triggered Flows) ---
-    print("Searching for Flows...")
-    # We use the Tooling API for Flows because it's much faster to filter by object
+    # --- 1. Validation Rules (Metadata API) ---
+    print("Scanning Opportunity Validation Rules...")
+    # Using list_metadata with a specific query for the type
+    all_rules_list = sf.mdapi.list_metadata(queries=[{'type': 'ValidationRule'}])
+    
+    # Filter for Opportunity only
+    opp_rule_names = [r['fullName'] for r in all_rules_list if r['fullName'].startswith('Opportunity.')]
+    
+    if opp_rule_names:
+        rules_meta = sf.mdapi.ValidationRule.read(opp_rule_names)
+        if isinstance(rules_meta, dict): rules_meta = [rules_meta]
+        # Only cache those that are currently True
+        cache["ValidationRules"] = [r['fullName'] for r in rules_meta if r.get('active') is True]
+
+    # --- 2. Apex Triggers (Tooling API) ---
+    print("Scanning Opportunity Apex Triggers...")
+    # TableEnumOrId filters specifically for the Opportunity object
+    trig_query = "SELECT Id, Name FROM ApexTrigger WHERE TableEnumOrId = 'Opportunity' AND Status = 'Active'"
+    trig_res = sf.tooling_execute(trig_query)
+    cache["Triggers"] = [{"id": r['Id'], "name": r['Name']} for r in trig_res.get('records', [])]
+
+    # --- 3. Flows / Flow Triggers (Tooling API) ---
+    print("Scanning Opportunity Flows...")
+    # FlowDefinitionView is the most reliable way to filter by Trigger Object
     flow_query = (
-        "SELECT DeveloperName, Status FROM FlowDefinitionView "
-        "WHERE TriggerObjectOrEventId = 'Opportunity' AND Status = 'Active'"
+        "SELECT Id, DeveloperName, ActiveVersionNumber FROM FlowDefinition "
+        "WHERE DeveloperName IN (SELECT DeveloperName FROM FlowDefinitionView "
+        "WHERE TriggerObjectOrEventId = 'Opportunity' AND Status = 'Active')"
     )
-    flow_results = sf.tooling_execute(flow_query)
-    cache_data["Flow"] = [f['DeveloperName'] for f in flow_results.get('records', [])]
+    flow_res = sf.tooling_execute(flow_query)
+    cache["Flows"] = [{"id": r['Id'], "name": r['DeveloperName'], "version": r['ActiveVersionNumber']} for r in flow_res.get('records', [])]
 
-    return cache_data
+    return cache
 
-def disable_automation():
-    active_items = get_active_automation()
-    
+def disable_all():
+    data = get_active_elements()
+    if not any(data.values()):
+        print("No active automation found to disable.")
+        return
+
     with open(CACHE_FILE, 'w') as f:
-        json.dump(active_items, f)
+        json.dump(data, f, indent=4)
     
+    # Disable Validation Rules - Passing the object directly
+    for v_name in data["ValidationRules"]:
+        sf.mdapi.ValidationRule.update({"fullName": v_name, "active": False})
+        print(f"Disabled Val Rule: {v_name}")
+
     # Disable Triggers
-    for t_name in active_items["ApexTrigger"]:
-        # We must provide the full body/content for triggers when updating status
-        # This is why 'status' is often easier to toggle via the Tooling API
-        sf.tooling_execute(f"SELECT Id FROM ApexTrigger WHERE Name = '{t_name}'")
-        # Optimization: Using Tooling API for status toggles is less 'heavy' than MDAPI for code
-        trigger_id = sf.tooling_execute(f"SELECT Id FROM ApexTrigger WHERE Name = '{t_name}'")['records'][0]['Id']
-        sf.tooling_execute({
-            'method': 'PATCH',
-            'url': f"tooling/sobjects/ApexTrigger/{trigger_id}",
-            'json': {"Status": "Inactive"}
-        })
-        print(f"Disabled Trigger: {t_name}")
+    for t in data["Triggers"]:
+        sf.tooling_execute(method='PATCH', url=f"tooling/sobjects/ApexTrigger/{t['id']}", json={"Status": "Inactive"})
+        print(f"Disabled Trigger: {t['name']}")
 
     # Disable Flows
-    for f_name in active_items["Flow"]:
-        # Deactivating a flow is done by updating the FlowDefinition
-        flow_def = sf.tooling_execute(f"SELECT Id FROM FlowDefinition WHERE DeveloperName = '{f_name}'")['records'][0]
-        sf.tooling_execute({
-            'method': 'PATCH',
-            'url': f"tooling/sobjects/FlowDefinition/{flow_def['Id']}",
-            'json': {"Metadata": {"activeVersionNumber": 0}}
-        })
-        print(f"Disabled Flow: {f_name}")
+    for f in data["Flows"]:
+        sf.tooling_execute(method='PATCH', url=f"tooling/sobjects/FlowDefinition/{f['id']}", json={"Metadata": {"activeVersionNumber": 0}})
+        print(f"Disabled Flow: {f['name']}")
 
-def restore_automation():
-    with open(CACHE_FILE, 'r') as f:
-        cache = json.load(f)
+def restore_all():
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print("Backup file not found.")
+        return
+
+    # Restore Validation Rules
+    for v_name in data["ValidationRules"]:
+        sf.mdapi.ValidationRule.update({"fullName": v_name, "active": True})
+        print(f"Restored Val Rule: {v_name}")
 
     # Restore Triggers
-    for t_name in cache["ApexTrigger"]:
-        trigger_id = sf.tooling_execute(f"SELECT Id FROM ApexTrigger WHERE Name = '{t_name}'")['records'][0]['Id']
-        sf.tooling_execute({'method': 'PATCH', 'url': f"tooling/sobjects/ApexTrigger/{trigger_id}", 'json': {"Status": "Active"}})
-        print(f"Restored Trigger: {t_name}")
+    for t in data["Triggers"]:
+        sf.tooling_execute(method='PATCH', url=f"tooling/sobjects/ApexTrigger/{t['id']}", json={"Status": "Active"})
+        print(f"Restored Trigger: {t['name']}")
 
-    # Restore Flows (Resets to latest version)
-    for f_name in cache["Flow"]:
-        flow_def = sf.tooling_execute(f"SELECT Id FROM FlowDefinition WHERE DeveloperName = '{f_name}'")['records'][0]
-        # Setting to null/omitting usually defaults to activating the latest version
-        # Or you can cache the specific version number in the disable step
-        sf.tooling_execute({
-            'method': 'PATCH', 
-            'url': f"tooling/sobjects/FlowDefinition/{flow_def['Id']}", 
-            'json': {"Metadata": {"activeVersionNumber": None}} 
-        })
-        print(f"Restored Flow: {f_name}")
+    # Restore Flows
+    for f in data["Flows"]:
+        sf.tooling_execute(method='PATCH', url=f"tooling/sobjects/FlowDefinition/{f['id']}", json={"Metadata": {"activeVersionNumber": f['version']}})
+        print(f"Restored Flow: {f['name']} (v{f['version']})")
 
-# --- Run ---
-disable_automation()
-# restore_automation()
+# --- Execution ---
+# disable_all()
+# restore_all()
